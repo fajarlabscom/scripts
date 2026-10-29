@@ -1,0 +1,1013 @@
+#!/bin/bash
+
+set -eo pipefail
+
+# Sane defaults (Don't override these settings here!)
+# Can be overridden by specifying a settings file as first parameter.
+# See settings.sh
+DRY_RUN=false
+UNATTENDED_INSTALL=false
+NEXTCLOUD_SERVER_FQDNS=""  # Ask user
+SERVER_FQDN=""             # Ask user
+SSL_CERT_PATH_RSA=""       # Will be auto filled, if not overriden by settings file.
+SSL_CERT_KEY_PATH_RSA=""   # Will be auto filled, if not overriden by settings file.
+SSL_CHAIN_PATH_RSA=""      # Will be auto filled, if not overriden by settings file.
+SSL_CERT_PATH_ECDSA=""     # Will be auto filled, if not overriden by settings file.
+SSL_CERT_KEY_PATH_ECDSA="" # Will be auto filled, if not overriden by settings file.
+SSL_CHAIN_PATH_ECDSA=""    # Will be auto filled, if not overriden by settings file.
+DHPARAM_PATH=""            # Will be auto filled, if not overriden by settings file.
+LOGFILE_PATH="setup-nextcloud-hpb-$(date +%Y-%m-%dT%H:%M:%SZ).log"
+TMP_DIR_PATH="./tmp"
+EXTERN_IPv4=""
+EXTERN_IPv6=""
+SECRETS_FILE_PATH=""   # Ask user
+EMAIL_USER_ADDRESS=""  # Ask user
+EMAIL_USER_PASSWORD="" # Ask user
+EMAIL_USER_USERNAME="" # Ask user
+EMAIL_SERVER_HOST=""   # Ask user
+EMAIL_SERVER_PORT=""   # Ask user
+DISABLE_SSH_SERVER=false
+SIGNALING_BUILD_FROM_SOURCES="" # Ask user
+SHOULD_INSTALL_COTURN=false
+SIGNALING_TURN_STATIC_AUTH_SECRET=""
+SIGNALING_COTURN_TLS_PORT=""
+DEBIAN_VERSION_ATLEAST="11"
+
+SETUP_VERSION=$(cat VERSION | head -n 1 | tr '\n' ' ')
+
+function show_dialogs() {
+	if [ "$LOGFILE_PATH" = "" ]; then
+		if [ "$UNATTENDED_INSTALL" = true ]; then
+			log_err "Can't continue since this is a non-interactive installation and I'm" \
+			        "missing LOGFILE_PATH!"
+			exit 1
+		fi
+
+		LOGFILE_PATH=$(
+			whiptail --title "Logfile path" \
+				--inputbox "Please enter a path to which this script can write $(
+				)a log file.\n\nThe log directory and its parent directories will get $(
+				)created automatically if they don't yet exist." 10 65 \
+				"setup-nextcloud-hpb-$(date +%Y-%m-%dT%H:%M:%SZ).log" \
+				3>&1 1>&2 2>&3
+		)
+	fi
+	log "Using '$LOGFILE_PATH' for LOGFILE_PATH"
+
+	if [ "$DRY_RUN" = "" ]; then
+		if [ "$UNATTENDED_INSTALL" = true ]; then
+			log_err "Can't continue since this is a non-interactive installation and I'm missing DRY_RUN!"
+			exit 1
+		fi
+
+		if whiptail --title "Dry-Run Mode" --yesno "Do you want to run in dry $(
+		)mode? This will ensure that no serious changes will get applied to your $(
+		)system." 10 65 --defaultno; then
+			DRY_RUN=true
+		else
+			DRY_RUN=true
+		fi
+	fi
+	log "Using '$DRY_RUN' for DRY_RUN".
+
+	if [ "$NEXTCLOUD_SERVER_FQDNS" = "" ]; then
+		if [ "$UNATTENDED_INSTALL" = true ]; then
+			log_err "Can't continue since this is a non-interactive installation and I'm" \
+			        "missing NEXTCLOUD_SERVER_FQDNS!"
+			exit 1
+		fi
+
+		NEXTCLOUD_SERVER_FQDNS=$(
+			whiptail --title "Nextcloud Server Domain" \
+				--inputbox "Please enter your Nextcloud server's domain name here. $(
+				)(Omit http(s)://, just put in the plain domain name!).\n\n$(
+				)You can also specify multiple Nextcloud servers by separating $(
+				)them using a comma." 12 65 \
+				"nextcloud.example.org" 3>&1 1>&2 2>&3
+		)
+	fi
+	# Filter out HTTPS:// or HTTP://
+	NEXTCLOUD_SERVER_FQDNS=$(echo $NEXTCLOUD_SERVER_FQDNS | sed -r "s#https?\:\/\/##gi")
+	log "Using '$NEXTCLOUD_SERVER_FQDNS' for NEXTCLOUD_SERVER_FQDNS".
+
+	if [ "$SERVER_FQDN" = "" ]; then
+		if [ "$UNATTENDED_INSTALL" = true ]; then
+			log_err "Can't continue since this is a non-interactive installation and I'm" \
+			        "missing SERVER_FQDN!"
+			exit 1
+		fi
+
+		default_fqdn="hpb.example.org"
+		if [ "$SHOULD_INSTALL_COTURN" = true ] && [ "$SHOULD_INSTALL_SIGNALING" != true ]; then
+			default_fqdn="turn.example.org"
+		fi
+
+		SERVER_FQDN=$(
+			whiptail --title "Server Domain" \
+				--inputbox "Masukkan FQDN server untuk layanan yang Anda pilih. $(
+				)Jika memilih HPB: masukkan domain HPB.\n$(
+				)Jika memilih Coturn saja: masukkan domain server TURN.\n$(
+				)(Tanpa http(s)://, hanya nama domain) $(
+				)\n\nPastikan domain sudah ada di DNS agar pembuatan sertifikat SSL berhasil!" \
+				14 70 "$default_fqdn" 3>&1 1>&2 2>&3
+		)
+	fi
+	# Filter out HTTPS:// or HTTP://
+	SERVER_FQDN=$(echo $SERVER_FQDN | sed -r "s#https?\:\/\/##gi")
+	log "Using '$SERVER_FQDN' for SERVER_FQDN".
+
+	# - SSL Cert stuff below -
+	if [ "$DHPARAM_PATH" = "" ]; then
+		DHPARAM_PATH="/etc/certs/dhp/dhp.pem"
+		log "Using default path '$DHPARAM_PATH' for DHPARAM_PATH".
+	else
+		log "Using '$DHPARAM_PATH' for DHPARAM_PATH".
+	fi
+
+	if [ "$SSL_CERT_PATH_RSA" = "" ]; then
+		SSL_CERT_PATH_RSA="/etc/letsencrypt/live/$SERVER_FQDN-rsa/fullchain.pem"
+		log "Using default path '$SSL_CERT_PATH_RSA' for SSL_CERT_PATH_RSA".
+	else
+		log "Using '$SSL_CERT_PATH_RSA' for SSL_CERT_PATH_RSA".
+	fi
+
+	if [ "$SSL_CERT_PATH_ECDSA" = "" ]; then
+		SSL_CERT_PATH_ECDSA="/etc/letsencrypt/live/$SERVER_FQDN-ecdsa/fullchain.pem"
+		log "Using default path '$SSL_CERT_PATH_ECDSA' for SSL_CERT_PATH_ECDSA".
+	else
+		log "Using '$SSL_CERT_PATH_ECDSA' for SSL_CERT_PATH_ECDSA".
+	fi
+
+	if [ "$SSL_CERT_KEY_PATH_RSA" = "" ]; then
+		SSL_CERT_KEY_PATH_RSA="/etc/letsencrypt/live/$SERVER_FQDN-rsa/privkey.pem"
+		log "Using default path '$SSL_CERT_KEY_PATH_RSA' for SSL_CERT_KEY_PATH_RSA".
+	else
+		log "Using '$SSL_CERT_KEY_PATH_RSA' for SSL_CERT_KEY_PATH_RSA".
+	fi
+
+	if [ "$SSL_CERT_KEY_PATH_ECDSA" = "" ]; then
+		SSL_CERT_KEY_PATH_ECDSA="/etc/letsencrypt/live/$SERVER_FQDN-ecdsa/privkey.pem"
+		log "Using default path '$SSL_CERT_KEY_PATH_ECDSA' for SSL_CERT_KEY_PATH_ECDSA".
+	else
+		log "Using '$SSL_CERT_KEY_PATH_ECDSA' for SSL_CERT_KEY_PATH_ECDSA".
+	fi
+	# -----
+
+	if [ "$SSL_CHAIN_PATH_RSA" = "" ]; then
+		SSL_CHAIN_PATH_RSA="/etc/letsencrypt/live/$SERVER_FQDN-rsa/chain.pem"
+		log "Using default path '$SSL_CHAIN_PATH_RSA' for SSL_CHAIN_PATH_RSA".
+	else
+		log "Using '$SSL_CHAIN_PATH_RSA' for SSL_CHAIN_PATH_RSA".
+	fi
+
+	if [ "$SSL_CHAIN_PATH_ECDSA" = "" ]; then
+		SSL_CHAIN_PATH_ECDSA="/etc/letsencrypt/live/$SERVER_FQDN-ecdsa/chain.pem"
+		log "Using default path '$SSL_CHAIN_PATH_ECDSA' for SSL_CHAIN_PATH_ECDSA".
+	else
+		log "Using '$SSL_CHAIN_PATH_ECDSA' for SSL_CHAIN_PATH_ECDSA".
+	fi
+
+	if [ "$TMP_DIR_PATH" = "" ]; then
+		if [ "$UNATTENDED_INSTALL" = true ]; then
+			log_err "Can't continue since this is a non-interactive installation and I'm" \
+			        "missing TMP_DIR_PATH!"
+			exit 1
+		fi
+
+		TMP_DIR_PATH=$(
+			whiptail --title "Temporary directory for configuration" \
+				--inputbox "Please enter a directory path in which this "$(
+				)"script can put temporary configuration files.\n\n"$(
+				)"The directory and its parents will get created automatically." \
+				10 65 "./tmp" 3>&1 1>&2 2>&3
+		)
+	fi
+	log "Using '$TMP_DIR_PATH' for TMP_DIR_PATH".
+
+	if [ "$SECRETS_FILE_PATH" = "" ]; then
+		if [ "$UNATTENDED_INSTALL" = true ]; then
+			log_err "Can't continue since this is a non-interactive installation and I'm" \
+			        "missing SECRETS_FILE_PATH!"
+			exit 1
+		fi
+
+		SECRETS_FILE_PATH=$(
+			whiptail --title "Secrets, passwords and configuration file" \
+				--inputbox "Please enter a path to a file where all "$(
+				)"secrets, passwords and configuration shall be stored.\n\n"$(
+				)"The directory and its parents get created automatically." \
+				10 65 "./nextcloud-hpb.secrets" 3>&1 1>&2 2>&3
+		)
+	fi
+	log "Using '$SECRETS_FILE_PATH' for SECRETS_FILE_PATH".
+
+	# - E-Mail stuff below -
+	if [ "$EMAIL_USER_ADDRESS" = "" ]; then
+		if [ "$UNATTENDED_INSTALL" = true ]; then
+			log_err "Can't continue since this is a non-interactive installation and I'm" \
+			        "missing EMAIL_USER_ADDRESS!"
+			exit 1
+		fi
+
+		EMAIL_USER_ADDRESS=$(
+			whiptail --title "E-Mail address" \
+				--inputbox "Enter a valid email address which will be used for $(
+				)notifications.$(
+				)Please note that this email must be yours and you can send $(
+				)emails with it using a SMTP server. If in doubt ask your $(
+				)email provider for SMTP server settings and credentials." \
+				10 65 "johndoe@example.com" 3>&1 1>&2 2>&3
+		)
+	fi
+	log "Using '$EMAIL_USER_ADDRESS' for EMAIL_USER_ADDRESS".
+
+	if [ "$EMAIL_USER_PASSWORD" = "" ]; then
+		if [ "$UNATTENDED_INSTALL" = true ]; then
+			log_err "Can't continue since this is a non-interactive installation and I'm" \
+			        "missing EMAIL_USER_PASSWORD!"
+			exit 1
+		fi
+
+		EMAIL_USER_PASSWORD=$(
+			whiptail --title "E-Mail SMTP password" \
+				--inputbox "Enter the password which msmtp will use to $(
+				)authenticate against the SMTP server." \
+				10 65 "" 3>&1 1>&2 2>&3
+		)
+	fi
+
+	if [[ -n "$EMAIL_USER_PASSWORD" ]]; then
+		# Do not expose password in log, mask it.
+		log "Using non-empty password for EMAIL_USER_PASSWORD".
+	else
+		log "No password set for EMAIL_USER_PASSWORD…"
+	fi
+
+	if [ "$EMAIL_USER_USERNAME" = "" ]; then
+		if [ "$UNATTENDED_INSTALL" = true ]; then
+			log_err "Can't continue since this is a non-interactive installation and I'm" \
+			        "missing EMAIL_USER_USERNAME!"
+			exit 1
+		fi
+
+		EMAIL_USER_USERNAME=$(
+			whiptail --title "E-Mail SMTP username" \
+				--inputbox "Enter the username which msmtp will use to $(
+				)authenticate against the SMTP server.$(
+				)Often the username is equal to the email address." \
+				10 65 "$EMAIL_USER_ADDRESS" 3>&1 1>&2 2>&3
+		)
+	fi
+	log "Using '$EMAIL_USER_USERNAME' for EMAIL_USER_USERNAME".
+
+	if [ "$EMAIL_SERVER_HOST" = "" ]; then
+		default_smtp_host="mail.example.org"
+		if [[ "$EMAIL_USER_ADDRESS" == *"@"* ]]; then
+			domain_part="${EMAIL_USER_ADDRESS#*@}"
+			if [[ -n "$domain_part" ]]; then
+				default_smtp_host="mail.$domain_part"
+			fi
+		fi
+
+		if [ "$UNATTENDED_INSTALL" = true ]; then
+			EMAIL_SERVER_HOST="$default_smtp_host"
+		else
+			EMAIL_SERVER_HOST=$(
+				whiptail --title "E-Mail SMTP host" \
+					--inputbox "Enter the host address on which the SMTP server is reachable." \
+					10 65 "$default_smtp_host" 3>&1 1>&2 2>&3
+			)
+		fi
+	fi
+	log "Using '$EMAIL_SERVER_HOST' for EMAIL_SERVER_HOST".
+
+	if [ "$EMAIL_SERVER_PORT" = "" ]; then
+		if [ "$UNATTENDED_INSTALL" = true ]; then
+			log_err "Can't continue since this is a non-interactive installation and I'm" \
+			        "missing EMAIL_SERVER_PORT!"
+			exit 1
+		fi
+
+		EMAIL_SERVER_PORT=$(
+			whiptail --title "E-Mail SMTP port" \
+				--inputbox "Enter the port on which the SMTP server is reachable." \
+				10 65 "587" 3>&1 1>&2 2>&3
+		)
+	fi
+	log "Using '$EMAIL_SERVER_PORT' for EMAIL_SERVER_PORT".
+	# -----
+
+	# Public IPs (manual input)
+	if { [ "$SHOULD_INSTALL_SIGNALING" = true ] || [ "$SHOULD_INSTALL_COTURN" = true ]; } && [ "$EXTERN_IPv4" = "" ]; then
+		if [ "$UNATTENDED_INSTALL" != true ]; then
+			EXTERN_IPv4=$(
+				whiptail --title "Public IPv4" \
+					--inputbox "Masukkan IPv4 publik server ini (untuk Coturn).\nKosongkan jika ingin autodetect." \
+					10 70 "" 3>&1 1>&2 2>&3
+			)
+		fi
+
+		if [ "$EXTERN_IPv4" = "" ]; then
+			EXTERN_IPv4=$(wget -4 https://ifconfig.co -O - -o /dev/null || true)
+		fi
+	fi
+	log "Using '$EXTERN_IPv4' for EXTERN_IPv4".
+
+	if { [ "$SHOULD_INSTALL_SIGNALING" = true ] || [ "$SHOULD_INSTALL_COTURN" = true ]; } && [ "$EXTERN_IPv6" = "" ]; then
+		if [ "$UNATTENDED_INSTALL" != true ]; then
+			EXTERN_IPv6=$(
+				whiptail --title "Public IPv6 (opsional)" \
+					--inputbox "Masukkan IPv6 publik server ini (opsional). Kosongkan jika ingin autodetect/IPv6 tidak ada." \
+					10 70 "" 3>&1 1>&2 2>&3
+			)
+		fi
+
+		if [ "$EXTERN_IPv6" = "" ]; then
+			EXTERN_IPv6=$(wget -6 https://ifconfig.co -O - -o /dev/null || true)
+		fi
+	fi
+	log "Using '$EXTERN_IPv6' for EXTERN_IPv6".
+
+	# TURN endpoint (when using external TURN with HPB-only)
+	if [ "$SIGNALING_COTURN_URL" = "" ]; then
+		if [ "$SHOULD_INSTALL_COTURN" = true ]; then
+			SIGNALING_COTURN_URL="$SERVER_FQDN"
+		else
+			if [ "$UNATTENDED_INSTALL" = true ]; then
+				log_err "Missing SIGNALING_COTURN_URL for unattended install! Isi FQDN TURN eksternal."
+				exit 1
+			fi
+
+			SIGNALING_COTURN_URL=$(
+				whiptail --title "TURN server FQDN" \
+					--inputbox "Masukkan FQDN server TURN (tanpa http/https) yang akan dipakai HPB.\nContoh: turn.example.org" \
+					12 70 "turn.example.org" 3>&1 1>&2 2>&3
+			)
+		fi
+	fi
+	log "Using '$SIGNALING_COTURN_URL' for SIGNALING_COTURN_URL".
+
+	# TURN static secret (shared between Coturn & HPB)
+	if { [ "$SHOULD_INSTALL_SIGNALING" = true ] || [ "$SHOULD_INSTALL_COTURN" = true ]; } && [ "$SIGNALING_TURN_STATIC_AUTH_SECRET" = "" ]; then
+		if [ "$SHOULD_INSTALL_COTURN" = true ] && [ "$UNATTENDED_INSTALL" = false ]; then
+			# Coturn dipasang di host ini: boleh generate otomatis.
+			SIGNALING_TURN_STATIC_AUTH_SECRET="$(openssl rand -hex 32)"
+			log "Generated TURN static secret for Coturn (disimpan ke secrets file, tidak ditampilkan)."
+		else
+			# HPB saja (atau unattended): wajib isi manual (copy dari server Coturn).
+			if [ "$UNATTENDED_INSTALL" = true ]; then
+				log_err "Missing SIGNALING_TURN_STATIC_AUTH_SECRET for unattended install! Isi secret TURN dari server Coturn."
+				exit 1
+			fi
+
+			SIGNALING_TURN_STATIC_AUTH_SECRET=$(
+				whiptail --title "TURN shared secret" \
+					--inputbox "Masukkan shared secret TURN (sama dengan di server Coturn). $(
+					)Tidak ada default; copy dari server Coturn." \
+					12 70 "" 3>&1 1>&2 2>&3
+			)
+			log "Using provided TURN static secret (value disembunyikan dari log)."
+		fi
+	fi
+
+	# TURN TLS port (for Coturn + references in HPB configs)
+	if { [ "$SHOULD_INSTALL_SIGNALING" = true ] || [ "$SHOULD_INSTALL_COTURN" = true ]; } && [ "$SIGNALING_COTURN_TLS_PORT" = "" ]; then
+		if [ "$UNATTENDED_INSTALL" = true ]; then
+			log_err "Missing SIGNALING_COTURN_TLS_PORT for unattended install!"
+			exit 1
+		fi
+
+		local port_warning=""
+		if [ "$SHOULD_INSTALL_NGINX" = true ]; then
+			port_warning="Catatan: Nginx memakai 443 untuk HTTPS. Jika butuh TURN di 443, gunakan IP terpisah atau pindahkan Nginx."
+		fi
+
+		SIGNALING_COTURN_TLS_PORT=$(
+			whiptail --title "TURN TLS port" \
+				--inputbox "Port TLS untuk Coturn (TURN/TLS/DTLS). $(
+				)Default 5349. Jika HPB tanpa Coturn, isi port TURN eksternal (umumnya 5349). $(
+				)Jika pilih 443, pastikan tidak bentrok dengan nginx/HTTPS $(
+				)dan service memiliki izin CAP_NET_BIND_SERVICE. $port_warning" \
+				13 75 "5349" 3>&1 1>&2 2>&3
+		)
+		log "Using '$SIGNALING_COTURN_TLS_PORT' for SIGNALING_COTURN_TLS_PORT."
+	fi
+
+	if { [ "$SHOULD_INSTALL_SIGNALING" = true ] || [ "$SHOULD_INSTALL_COTURN" = true ]; } && [ "$SIGNALING_COTURN_TLS_PORT" != "" ]; then
+		if ! [[ "$SIGNALING_COTURN_TLS_PORT" =~ ^[0-9]+$ ]] || [ "$SIGNALING_COTURN_TLS_PORT" -le 0 ] || [ "$SIGNALING_COTURN_TLS_PORT" -gt 65535 ]; then
+			log_err "SIGNALING_COTURN_TLS_PORT must be a number between 1 and 65535."
+			exit 1
+		fi
+	fi
+
+	CERTBOT_AGREE_TOS=""
+	LETSENCRYPT_TOS_URL="https://letsencrypt.org/documents/LE-SA-v1.2-November-15-2017.pdf"
+	if [ "$UNATTENDED_INSTALL" != true ]; then
+		if whiptail --title "Letsencrypt - Terms of Service" \
+			--yesno "Do you want to silently accept Letsencrypt's Terms of $(
+			)Service here? If you select 'no' here, the Terms of Service $(
+			)will be displayed during SSL certificate retrieval during the $(
+			)installation process.\n\nYou can always read Letsencrypt's $(
+			)Terms of Service here:\n$LETSENCRYPT_TOS_URL" \
+			13 75 3>&1 1>&2 2>&3; then
+			CERTBOT_AGREE_TOS="--agree-tos"
+		fi
+	fi
+	log "Using '$CERTBOT_AGREE_TOS' for CERTBOT_AGREE_TOS."
+
+	if [ "$DISABLE_SSH_SERVER" != true ]; then
+		if [ "$UNATTENDED_INSTALL" != true ]; then
+			if whiptail --title "Deactivate SSH server?" --defaultno \
+				--yesno "Should the 'ssh' service be disabled?" \
+				10 70 3>&1 1>&2 2>&3; then
+				DISABLE_SSH_SERVER=true
+			fi
+		fi
+	fi
+	log "Using '$DISABLE_SSH_SERVER' for DISABLE_SSH_SERVER."
+
+	# For UNATTENDED_INSTALL, please fill SIGNALING_BUILD_FROM_SOURCES via settings.sh.
+	if [ "$UNATTENDED_INSTALL" != true ] && [ "$SHOULD_INSTALL_SIGNALING" = true ]; then
+
+		if [ "$SIGNALING_PACKAGES_AVAILABLE" = true ]; then
+			if [ "$DEBIAN_VERSION_MAJOR" = "11" ]; then
+				whiptail --title "Build from sources." --defaultno \
+				    --msgbox "The package 'nextcloud-spreed-signaling' is not available $(
+					)in this version of Debian (Debian 11). Also 'nats-server' and $(
+					)'coturn' in Debian 11 are rather old and buggy. To avoid these $(
+					)problems the packages will be built and installed from sources." \
+				    13 65 3>&1 1>&2 2>&3
+				SIGNALING_BUILD_FROM_SOURCES=true
+			fi
+
+			# A working version of nextcloud-spreed-signaling is available since
+			# Debian 12 (backports) and Debian 13 (provided first in Debian testing
+			# on 2023-10-22) and newer
+			if ! [[ -n "" ]]; then # Remove '!', if Debian catched up with its nextcloud-spreed-signaling package.
+				if whiptail --title "Build from sources?" \
+					--yesno "Would you like to build and install Signaling $(
+					)packages from sources to get the newest possible version? $(
+					)The alternative method, installing the Debian packages, $(
+					)is not suggested. Because some packages are rather old $(
+					)currently, therefore we would highly suggest $(
+					)building from source e.g. 'yes' option." \
+					13 65 3>&1 1>&2 2>&3; then
+					SIGNALING_BUILD_FROM_SOURCES=true
+				fi
+			else
+				if whiptail --title "Build from sources?" --defaultno \
+					--yesno "Would you like to build and install Signaling $(
+					)packages from sources to get the newest possible version? $(
+					)This is normally not required and we suggest using the $(
+					)existing Debian packages." \
+					13 65 3>&1 1>&2 2>&3; then
+					SIGNALING_BUILD_FROM_SOURCES=true
+				fi
+			fi
+		else
+			whiptail --title "Build from sources?" \
+				--msgbox "Some required Signaling packages are not available $(
+				)in the package archives. The required packages will get $(
+				)built and installed from sources." 13 65
+			SIGNALING_BUILD_FROM_SOURCES=true
+		fi
+	fi
+	log "Using '$SIGNALING_BUILD_FROM_SOURCES' for SIGNALING_BUILD_FROM_SOURCES".
+}
+
+# SUPPORT FOR COLORS! (If terminal supports it)
+# Check if stdout is a terminal and set colors if available.
+if test -t 1; then
+	# Pause set -e
+	set +e
+	# See if it supports colors...
+	ncolors=$(tput colors 2> /dev/null)
+	set -e
+
+	if [[ -n "$ncolors" && "$ncolors" -ge 8 ]]; then
+		bold="$(tput bold)"
+		underline="$(tput smul)"
+		standout="$(tput smso)"
+		normal="$(tput sgr0)"
+		black="$(tput setaf 0)"
+		red="$(tput setaf 1)"
+		green="$(tput setaf 2)"
+		yellow="$(tput setaf 3)"
+		blue="$(tput setaf 4)"
+		magenta="$(tput setaf 5)"
+		cyan="$(tput setaf 6)"
+		white="$(tput setaf 7)"
+	fi
+fi
+
+# Trap to reset terminal colors on exit
+trap 'printf "%s" "$normal"' EXIT INT TERM HUP
+
+function log() {
+	# Strip ANSI color codes before writing to log file
+	echo -e "$@" | sed -r "s/\x1B\[([0-9]{1,3}(;[0-9]{1,2})?)?[mGK]//g" >> "$LOGFILE_PATH"
+	echo -e "${blue}$@${normal}"
+}
+
+function log_err() {
+	# Strip ANSI color codes before writing to log file
+	echo -e "$@" | sed -r "s/\x1B\[([0-9]{1,3}(;[0-9]{1,2})?)?[mGK]//g" >> "$LOGFILE_PATH"
+	echo -e "${red}✗ Error: $@${normal}"
+}
+
+function generate_dhparam_file() {
+	if [ "$BUILT_DHPARAM_FILE" == "true" ]; then
+		# Skip if we already generated dhparam file.
+		return 0
+	fi
+
+	if [ -s "$DHPARAM_PATH" ]; then
+		log "Found existing dhparam file at '$DHPARAM_PATH', skipping regeneration."
+		BUILT_DHPARAM_FILE="true"
+		return 0
+	fi
+
+	log "Generating new dhparam file (2048 bit)…"
+	is_dry_run || mkdir -p "$(dirname $DHPARAM_PATH)"
+	is_dry_run || touch "$DHPARAM_PATH"
+	is_dry_run || openssl dhparam -dsaparam -out "$DHPARAM_PATH" 2048
+	is_dry_run || chmod 644 "$DHPARAM_PATH"
+
+	BUILT_DHPARAM_FILE="true"
+}
+
+# Deploys target_file_path to source_file_path while respecting
+# potential custom user config.
+# param 1: source_file_path
+# param 2: target_file_path
+# returns: 1 if already deployed and 0 if not.
+function deploy_file() {
+	source_file_path="$1"
+	target_file_path="$2"
+	log "Deploying $target_file_path"
+	if [[ -s "$target_file_path" ]]; then
+		checksum_deployed=$(sha256sum "$target_file_path" | cut -d " " -f1)
+		checksum_expected=$(sha256sum "$source_file_path" | cut -d " " -f1)
+		if [ "${checksum_deployed}" = "${checksum_expected}" ]; then
+			log "$target_file_path was already deployed."
+			return 1
+		else
+			if [ "$UNATTENDED_INSTALL" = true ]; then
+				is_dry_run "Would've replaced existing '$target_file_path'." || \
+					cp "$source_file_path" "$target_file_path"
+			else
+				log "file '$target_file_path' exists and will be updated deployed."
+				is_dry_run "Would've replaced existing '$target_file_path'." || \
+					cp "$source_file_path" "$target_file_path"
+			fi
+		fi
+	else
+		# Target file is empty or doesn't exist.
+		is_dry_run "Would've deployed '$target_file_path'." || cp "$source_file_path" "$target_file_path"
+	fi
+	return 0
+}
+
+function check_root_perm() {
+	if [[ $(id -u) -ne 0 ]]; then
+		log_err "Please run the this (setup-nextcloud-hpb) script as root."
+		exit 1
+	fi
+}
+
+function check_debian_system() {
+	# File exists and not empty
+	if ! [ -s /etc/os-release ]; then
+		log_err "Couldn't read /etc/os-release! What kind of OS is this?"
+		exit 1
+	else
+		source /etc/os-release
+		if [ "$ID" != "debian" ]; then
+			log_err "This host does not run Debian. Wrong distribution!"
+			exit 1
+		fi
+		if [ -z "$VERSION_ID" ] && [[ "$VERSION_CODENAME" =~ "sid" ]]; then
+			# /etc/os-release lacks VERSION_ID in testing/unstable, so assume
+			# a not-yet-released version of Debian
+			VERSION_ID=999
+		fi
+		if dpkg --compare-versions $VERSION_ID lt $DEBIAN_VERSION_ATLEAST; then
+			log_err "Debian version '$VERSION_ID' not supported (too old)!"
+			exit 1
+		fi
+
+		DEBIAN_VERSION_MAJOR=$VERSION_ID
+	fi
+}
+
+function check_available_signaling_packages() {
+	log "Checking for packages availability…"
+
+	if apt-cache policy nextcloud-spreed-signaling 2>/dev/null | grep "Candidate:" | grep -qv "(none)"; then
+		log "Package 'nextcloud-spreed-signaling' is available."
+	else
+		log_err "Package 'nextcloud-spreed-signaling' is NOT available, we are forced to build from sources."
+		return 1
+	fi
+
+	if apt-cache policy nats-server 2>/dev/null | grep "Candidate:" | grep -qv "(none)"; then
+		log "Package 'nats-server' is available."
+	else
+		log_err "Package 'nats-server' is NOT available, we are forced to build from sources."
+		return 1
+	fi
+
+	if apt-cache policy coturn 2>/dev/null | grep "Candidate:" | grep -qv "(none)"; then
+		log "Package 'coturn' is available."
+	else
+		log_err "Package 'coturn' is NOT available, we are forced to build from sources."
+		return 1
+	fi
+
+	if apt-cache policy janus 2>/dev/null | grep "Candidate:" | grep -qv "(none)"; then
+		log "Package 'janus' is available."
+	else
+		log_err "Package 'janus' is NOT available, we are forced to build from sources."
+		return 1
+	fi
+}
+
+# Executes command only if NOT in dry-run mode.
+# Usage: is_dry_run "Description of what would happen" || actual_command
+# If in dry-run mode: logs the description and returns success (allows || to skip command)
+# If not in dry-run mode: returns failure (allows || to execute command)
+function is_dry_run() {
+	if [ "$DRY_RUN" == true ]; then
+		if [[ -n "$1" ]]; then
+			log "${yellow}$1${normal}"
+		fi
+		return 0
+	else
+		return 1
+	fi
+}
+
+function announce_installation() {
+	local software_name="$1"
+	local box_width=$((${#software_name} + 4))
+
+	# Top border
+	echo -e "${green}┌$(printf '─%.0s' $(seq 1 $box_width))┐${normal}"
+	# Content
+	echo -e "${green}│  ${software_name}  │${normal}"
+	# Bottom border
+	echo -e "${green}└$(printf '─%.0s' $(seq 1 $box_width))┘${normal}"
+
+	sleep 1
+}
+
+function main() {
+	if [ -s "$LOGFILE_PATH" ]; then
+		rm -v $LOGFILE_PATH |& tee -a $LOGFILE_PATH
+	fi
+
+	log "Starting script at: $(date)"
+	log "Nextcloud HPB setup script version: $SETUP_VERSION"
+
+	check_root_perm
+
+	# Make sure PATH is correctly set.
+	# There are VPS providers which alter the PATH env variable.
+	export PATH="$PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+	check_debian_system
+
+	# We need to test if nextcloud-signaling-spreed, coturn, nats-server and
+	# janus are available in the apt sources configured on this system in order
+	# to pre-select the right answer in the dialog later on.
+	if check_available_signaling_packages; then
+		SIGNALING_PACKAGES_AVAILABLE=true
+	else
+		SIGNALING_PACKAGES_AVAILABLE=false
+	fi
+
+	# Load Settings (hopefully vars above get overwritten!)
+	SETTINGS_FILE="$1"
+	if [ -s "$SETTINGS_FILE" ]; then
+		log "Loading settings file '$SETTINGS_FILE'…"
+		source "$SETTINGS_FILE"
+	else
+		log "No settings file specified using defaults or asking user for input."
+	fi
+
+	### INSTALL DEPENDENCIES
+	# Check 'whiptail' dependency
+	if ! command -v whiptail &>/dev/null; then
+		log "whiptail could not be found! Trying to install it…"
+		if ! is_dry_run; then
+			if [ "$UNATTENDED_INSTALL" == true ]; then
+				log "Trying unattended install for 'whiptail'."
+				export DEBIAN_FRONTEND=noninteractive
+				args_apt="-qqy"
+			else
+				args_apt="-y"
+			fi
+
+			apt-get install "$args_apt" whiptail 2>&1 | tee -a $LOGFILE_PATH
+		fi
+	fi
+
+	# Check 'wget' dependency
+	if ! command -v wget &>/dev/null; then
+		log "wget could not be found! Trying to install it…"
+		if ! is_dry_run; then
+			if [ "$UNATTENDED_INSTALL" == true ]; then
+				log "Trying unattended install for 'wget'."
+				export DEBIAN_FRONTEND=noninteractive
+				args_apt="-qqy"
+			else
+				args_apt="-y"
+			fi
+
+			apt-get install "$args_apt" wget 2>&1 | tee -a $LOGFILE_PATH
+		fi
+	fi
+	###
+
+	# Let's check if we should open dialogs.
+	if [ "$UNATTENDED_INSTALL" != true ]; then
+		# Override settings file!
+		SHOULD_INSTALL_UFW=false
+		SHOULD_INSTALL_COLLABORA=false
+		SHOULD_INSTALL_COTURN=false
+		SHOULD_INSTALL_SIGNALING=false
+		SHOULD_INSTALL_CERTBOT=false
+		SHOULD_INSTALL_NGINX=false
+		SHOULD_INSTALL_UNATTENDEDUPGRADES=false
+		SHOULD_INSTALL_MSMTP=false
+		SIGNALING_COTURN_TLS_PORT=""
+
+		CHOICES=$(whiptail --title "Select services" --separate-output \
+			--checklist "Use the space bar key to select/deselect the services $(
+			)you want to install.\n\nNote: Depending on your choices, supporting $(
+			)packages like Certbot, Nginx, ufw, unattended-upgrades, msmtp may $(
+			)also be installed." 16 90 4 \
+			"1" "Install Collabora (coolwsd, code-brand)" OFF \
+			"2" "Install HPB signaling (nats-server, janus, nextcloud-spreed-signaling; requires TURN endpoint info)" OFF \
+			"3" "Install Coturn (TURN server) + certbot + ufw" OFF \
+			"4" "Install HPB signaling + Coturn (complete Talk backend stack)" OFF \
+			3>&1 1>&2 2>&3 || true)
+
+		if [ -z "$CHOICES" ]; then
+			log_err "No service was selected (user hit Cancel or unselected all options) Exiting…"
+			exit 0
+		else
+			for CHOICE in $CHOICES; do
+				case "$CHOICE" in
+				"1")
+					log "Collabora (certbot, nginx, ufw) will be installed."
+					SHOULD_INSTALL_UFW=true
+					SHOULD_INSTALL_COLLABORA=true
+					SHOULD_INSTALL_NGINX=true
+					SHOULD_INSTALL_CERTBOT=true
+					SHOULD_INSTALL_UNATTENDEDUPGRADES=true
+					SHOULD_INSTALL_MSMTP=true
+					;;
+				"2")
+					log "HPB signaling (certbot, nginx, ufw) will be installed."
+					SHOULD_INSTALL_UFW=true
+					SHOULD_INSTALL_SIGNALING=true
+					SHOULD_INSTALL_NGINX=true
+					SHOULD_INSTALL_CERTBOT=true
+					SHOULD_INSTALL_UNATTENDEDUPGRADES=true
+					SHOULD_INSTALL_MSMTP=true
+					;;
+				"3")
+					log "Coturn (certbot, ufw, unattended-upgrades, msmtp) will be installed."
+					SHOULD_INSTALL_UFW=true
+					SHOULD_INSTALL_COTURN=true
+					SHOULD_INSTALL_CERTBOT=true
+					SHOULD_INSTALL_UNATTENDEDUPGRADES=true
+					SHOULD_INSTALL_MSMTP=true
+					;;
+				"4")
+					log "HPB signaling + Coturn (certbot, nginx, ufw) will be installed."
+					SHOULD_INSTALL_UFW=true
+					SHOULD_INSTALL_COTURN=true
+					SHOULD_INSTALL_SIGNALING=true
+					SHOULD_INSTALL_NGINX=true
+					SHOULD_INSTALL_CERTBOT=true
+					SHOULD_INSTALL_UNATTENDEDUPGRADES=true
+					SHOULD_INSTALL_MSMTP=true
+					;;
+				*)
+					log_err "Unsupported service $CHOICE!" >&2
+					exit 1
+					;;
+				esac
+			done
+		fi
+	fi
+
+	show_dialogs
+
+	# Transform Nextcloud server URLs into array.
+	# Change comma (,) to whitespace
+	NEXTCLOUD_SERVER_FQDNS=($(echo "$NEXTCLOUD_SERVER_FQDNS" | tr ',' ' '))
+	log "Splitting Nextcloud server domains into:"
+	log "$(printf '\t- %s\n' "${NEXTCLOUD_SERVER_FQDNS[@]}")"
+
+	is_dry_run &&
+		log "Running in dry-mode. This script won't actually do anything on" \
+			"your system!"
+
+	if [ "$UNATTENDED_INSTALL" = true ]; then
+		log "Trying unattented installation."
+	fi
+
+	if ! [ -e "$TMP_DIR_PATH" ]; then
+		log "Creating '$TMP_DIR_PATH'."
+		mkdir -p "$TMP_DIR_PATH" 2>&1 | tee -a $LOGFILE_PATH
+	else
+		log "Deleted contents of '$TMP_DIR_PATH'."
+		rm -vr "$TMP_DIR_PATH"/* 2>&1 | tee -a $LOGFILE_PATH || true
+	fi
+
+	log "Moving config files into '$TMP_DIR_PATH'."
+	cp -rv data/* "$TMP_DIR_PATH" 2>&1 | tee -a $LOGFILE_PATH
+
+	log "Cleaning old /etc/hosts entries for '$SERVER_FQDN' and hostname."
+	if ! is_dry_run; then
+		sed -i "/[[:space:]]$SERVER_FQDN/d" /etc/hosts
+		sed -i "/[[:space:]]$(hostname)/d" /etc/hosts
+	fi
+
+	if [ -n "$EXTERN_IPv4" ]; then
+		entry="$EXTERN_IPv4 $SERVER_FQDN $(hostname)"
+		log "Deploying '$entry' in /etc/hosts."
+		is_dry_run || echo "$entry" >>/etc/hosts
+	else
+		log "Skipping /etc/hosts addition because EXTERN_IPv4 is empty; relying on DNS."
+	fi
+
+	scripts=('src/setup-ufw.sh' 'src/setup-collabora.sh'
+		'src/setup-signaling.sh' 'src/setup-nginx.sh' 'src/setup-certbot.sh'
+		'src/setup-unattendedupgrades.sh' 'src/setup-msmtp.sh')
+	for script in "${scripts[@]}"; do
+		log "Sourcing '$script'."
+		source "$script"
+	done
+
+	if [ "$SHOULD_INSTALL_UFW" = true ]; then install_ufw; else
+		log "Won't install UFW."
+	fi
+	if [ "$SHOULD_INSTALL_COLLABORA" = true ]; then install_collabora; else
+		log "Won't install Collabora."
+	fi
+	if [ "$SHOULD_INSTALL_COTURN" = true ]; then install_coturn; else
+		log "Won't install Coturn."
+	fi
+	if [ "$SHOULD_INSTALL_SIGNALING" = true ]; then install_signaling; else
+		log "Won't install Signaling."
+	fi
+	if [ "$SHOULD_INSTALL_CERTBOT" = true ]; then install_certbot; else
+		log "Won't install Certbot."
+	fi
+	if [ "$SHOULD_INSTALL_NGINX" = true ]; then install_nginx; else
+		log "Won't install Nginx."
+	fi
+	if [ "$SHOULD_INSTALL_UNATTENDEDUPGRADES" = true ]; then install_unattendedupgrades; else
+		log "Won't install unattended upgrades."
+	fi
+	if [ "$SHOULD_INSTALL_MSMTP" = true ]; then install_msmtp; else
+		log "Won't install msmtp email setup."
+	fi
+
+	log "Every installation completed."
+
+	if [ "DISABLE_SSH_SERVER" = true ]; then
+		log "Disabling 'ssh' service…"
+		is_dry_run || systemctl disable ssh
+	fi
+
+	log "Enabling and restarting services…"
+	SERVICES_TO_ENABLE=()
+	if [ "$SHOULD_INSTALL_UFW" = true ]; then
+		SERVICES_TO_ENABLE+=("ufw")
+	fi
+	if [ "$SHOULD_INSTALL_COLLABORA" = true ]; then
+		SERVICES_TO_ENABLE+=("coolwsd")
+	fi
+	if [ "$SHOULD_INSTALL_SIGNALING" = true ]; then
+		SERVICES_TO_ENABLE+=("nats-server" "nextcloud-spreed-signaling" "janus")
+	fi
+	if [ "$SHOULD_INSTALL_COTURN" = true ]; then
+		SERVICES_TO_ENABLE+=("coturn")
+	fi
+	#if [ "$SHOULD_INSTALL_CERTBOT" = true ]; then fi
+	if [ "$SHOULD_INSTALL_NGINX" = true ]; then
+		SERVICES_TO_ENABLE+=("nginx")
+	fi
+	#if [ "$SHOULD_INSTALL_UNATTENDEDUPGRADES" = true ]; then fi
+	#if [ "$SHOULD_INSTALL_MSMTP" = true ]; then fi
+
+	SERVICE_ERRORS=()
+	if ! is_dry_run; then
+		for i in "${SERVICES_TO_ENABLE[@]}"; do
+			log "Enabling and restarting service '$i'…"
+			if ! systemctl unmask "$i" 2>&1 | tee -a $LOGFILE_PATH; then
+				SERVICE_ERRORS+=("Failed to unmask service '$i'")
+			fi
+
+			if ! service "$i" stop 2>&1 | tee -a $LOGFILE_PATH; then
+				SERVICE_ERRORS+=("Failed to stop service '$i'")
+			fi
+
+			if ! systemctl enable --now "$i" 2>&1 | tee -a $LOGFILE_PATH; then
+				SERVICE_ERRORS+=("Failed to enable/start service '$i'")
+			fi
+			sleep 0.25s
+		done
+	fi
+
+	log "======================================================================"
+	# if [ "$SHOULD_INSTALL_UFW" = true ]; then
+	# 	ufw_print_info
+	# 	log "======================================================================"
+	# fi
+	if [ "$SHOULD_INSTALL_COLLABORA" = true ]; then
+		collabora_print_info
+		log "======================================================================"
+	fi
+	if [ "$SHOULD_INSTALL_COTURN" = true ]; then
+		coturn_print_info
+		log "======================================================================"
+	fi
+	if [ "$SHOULD_INSTALL_SIGNALING" = true ]; then
+		signaling_print_info
+		log "======================================================================"
+	fi
+	if [ "$SHOULD_INSTALL_CERTBOT" = true ]; then
+		certbot_print_info
+		log "======================================================================"
+	fi
+	if [ "$SHOULD_INSTALL_NGINX" = true ]; then
+		nginx_print_info
+		log "======================================================================"
+	fi
+	# if [ "$SHOULD_INSTALL_UNATTENDEDUPGRADES" = true ]; then
+	# 	unattendedupgrades_print_info
+	#	log "======================================================================"
+	# fi
+	if [ "$SHOULD_INSTALL_MSMTP" = true ]; then
+		msmtp_print_info
+		log "======================================================================"
+	fi
+
+	is_dry_run || mkdir -p "$(dirname "$SECRETS_FILE_PATH")"
+	is_dry_run || touch "$SECRETS_FILE_PATH"
+	is_dry_run || chmod 0640 "$SECRETS_FILE_PATH"
+
+	echo -e "This file contains secrets, passwords and configuration" \
+		"generated by the Nextcloud High-Performance backend setup." \
+		>$SECRETS_FILE_PATH
+	# if [ "$SHOULD_INSTALL_UFW" = true ]; then
+	# 	ufw_write_secrets_to_file "$SECRETS_FILE_PATH"
+	# fi
+	if [ "$SHOULD_INSTALL_COLLABORA" = true ]; then
+		collabora_write_secrets_to_file "$SECRETS_FILE_PATH"
+	fi
+	if [ "$SHOULD_INSTALL_COTURN" = true ]; then
+		coturn_write_secrets_to_file "$SECRETS_FILE_PATH"
+	fi
+	if [ "$SHOULD_INSTALL_SIGNALING" = true ]; then
+		signaling_write_secrets_to_file "$SECRETS_FILE_PATH"
+	fi
+	if [ "$SHOULD_INSTALL_CERTBOT" = true ]; then
+		certbot_write_secrets_to_file "$SECRETS_FILE_PATH"
+	fi
+	if [ "$SHOULD_INSTALL_NGINX" = true ]; then
+		nginx_write_secrets_to_file "$SECRETS_FILE_PATH"
+	fi
+	# if [ "$SHOULD_INSTALL_UNATTENDEDUPGRADES" = true ]; then
+	# 	unattendedupgrades_write_secrets_to_file "$SECRETS_FILE_PATH"
+	# fi
+	if [ "$SHOULD_INSTALL_MSMTP" = true ]; then
+		msmtp_write_secrets_to_file "$SECRETS_FILE_PATH"
+	fi
+
+	# Display service errors summary if any occurred
+	if [ ${#SERVICE_ERRORS[@]} -gt 0 ]; then
+		log ""
+		log "======================================================================"
+		log_err "The following service management errors occurred:"
+		for error in "${SERVICE_ERRORS[@]}"; do
+			log_err "  - $error"
+		done
+		log_err "Please check the services manually using 'systemctl status <service-name>'"
+		log "======================================================================"
+		log ""
+	fi
+
+	log "\nThank you for using this script.\n"
+}
+
+# Execute main function.
+main "$1"
+
+set +eo pipefail
